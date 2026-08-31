@@ -7,6 +7,7 @@ import { ProfileTabPillGroup } from '@/components/common/ProfileTabPill';
 import { useProfileStore } from '@/hooks/useProfileStore';
 import { fetchAllTrades } from '@/services/tradeHistory.service';
 import type { Trade } from '@/services/tradeHistory.service';
+import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 
 const TABS = [
 	{ label: 'Holdings', value: 'holdings', icon: <BarChart2 /> },
@@ -84,6 +85,7 @@ export default function ProfilePage() {
 			setIsExporting(false);
 		}
 	}, []);
+	useDocumentTitle('My Portfolio — AccessLayer');
 
 	return (
 		<main className="min-h-screen bg-[#06111f] px-6 py-16 text-white md:px-12">
