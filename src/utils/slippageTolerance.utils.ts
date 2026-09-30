@@ -7,8 +7,23 @@
  * than the tolerance allows.
  */
 
-/** Preset slippage tolerance percentages surfaced in the selector UI. */
-export const SLIPPAGE_TOLERANCE_PRESETS = [0.5, 1, 5] as const;
+/**
+ * Slippage tolerance selector logic — issue #877.
+ *
+ * A trade preview's `max_price` (for buys) or `min_price` (for sells) is
+ * the preview price adjusted by the user's selected slippage tolerance:
+ * buys accept paying up to `tolerance%` more than the preview price, sells
+ * accept receiving up to `tolerance%` less.
+ */
+
+/** Preset tolerance options shown in the slippage selector, in percent (#919). */
+export const SLIPPAGE_TOLERANCE_PRESETS = [0.5, 1, 2] as const;
+
+/** Tolerances above this percentage are rejected as invalid. */
+export const MAX_SLIPPAGE_TOLERANCE_PERCENT = 50;
+
+/** Tolerances below this percentage are rejected as invalid. */
+export const MIN_SLIPPAGE_TOLERANCE_PERCENT = 0;
 
 /** Default tolerance applied when the user has not made a selection. */
 export const DEFAULT_SLIPPAGE_TOLERANCE_PERCENT = 1;
@@ -193,33 +208,3 @@ export interface SlippageToleranceValidation {
 	error: string | null;
 }
 
-/**
- * Validates a (typically custom) slippage tolerance percentage.
- *
- * Valid range is [0, 50]. Anything above 50% is rejected as an unreasonably
- * high tolerance that would let a trade execute far away from the preview
- * price; negative values and non-finite input are also rejected.
- */
-export function validateSlippageTolerance(
-	tolerancePercent: number
-): SlippageToleranceValidation {
-	if (!Number.isFinite(tolerancePercent)) {
-		return { valid: false, error: 'Enter a valid slippage tolerance.' };
-	}
-
-	if (tolerancePercent < MIN_SLIPPAGE_TOLERANCE_PERCENT) {
-		return {
-			valid: false,
-			error: 'Slippage tolerance cannot be negative.',
-		};
-	}
-
-	if (tolerancePercent > MAX_SLIPPAGE_TOLERANCE_PERCENT) {
-		return {
-			valid: false,
-			error: `Slippage tolerance cannot exceed ${MAX_SLIPPAGE_TOLERANCE_PERCENT}%.`,
-		};
-	}
-
-	return { valid: true, error: null };
-}

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { StableButtonContent } from '@/components/ui/stable-button-content';
 import {
@@ -9,6 +9,14 @@ import {
 	DialogHeader,
 	DialogTitle,
 } from '@/components/ui/dialog';
+import {
+	BottomSheet,
+	BottomSheetContent,
+	BottomSheetDescription,
+	BottomSheetHandle,
+	BottomSheetTitle,
+} from '@/components/ui/bottom-sheet';
+import { useIsMobile } from '@/hooks/useIsMobile';
 import { cn } from '@/lib/utils';
 import { formatNumber } from '@/utils/numberFormat.utils';
 import {
@@ -18,21 +26,63 @@ import {
 import PercentageBadge from '@/components/common/PercentageBadge';
 import NetworkFeeHint from '@/components/common/NetworkFeeHint';
 import BuyFeeBreakdown from '@/components/common/BuyFeeBreakdown';
+import SellFeeBreakdown from '@/components/common/SellFeeBreakdown';
+import LaunchPenaltyWarning from '@/components/common/LaunchPenaltyWarning';
 import SlippageToleranceSelector from '@/components/common/SlippageToleranceSelector';
-import { TRADE_FEE_ESTIMATE, FEE_BOUNDS } from '@/constants/fees';
+import {
+	TRADE_FEE_ESTIMATE,
+	FEE_BOUNDS,
+	BUY_QUANTITY_BOUNDS,
+} from '@/constants/fees';
 import { formatTransactionFeeDisplay } from '@/utils/transactionFee.utils';
 import { clampBuyQuantity } from '@/utils/buyQuantity';
+import { calculateLaunchPenalty } from '@/utils/launchPenalty.utils';
 import {
 	fetchPricePreview,
 	type FeeBreakdown,
 } from '@/utils/pricePreview.utils';
 import {
-	DEFAULT_SLIPPAGE_TOLERANCE_PERCENT,
+	buildDynamicFeeBreakdown,
+	type ContractDynamicFeeRate,
+	type DynamicFeeBreakdown as DynamicFeeBreakdownData,
+} from '@/utils/dynamicFeeRate.utils';
+import { courseService } from '@/services/course.service';
+import PriceImpactWarning from '@/components/common/PriceImpactWarning';
+import PriceImpactOverrideCheckbox from '@/components/common/PriceImpactOverrideCheckbox';
+import TradeConfirmationModal from '@/components/common/TradeConfirmationModal';
+import {
+	calculateTradePriceImpact,
+	isHighPriceImpact,
+} from '@/utils/priceImpact.utils';
+import {
 	computeSlippageBounds,
 	type SlippageBounds,
 } from '@/utils/slippageTolerance.utils';
+import type { KeyConfig } from '@/services/course.service';
+import SpreadIndicator from '@/components/common/SpreadIndicator';
+import HoldingCapIndicator from '@/components/common/HoldingCapIndicator';
+import { useSlippageTolerancePreference } from '@/hooks/useSlippageTolerancePreference';
+import CircuitBreakerStatusIndicator from '@/components/common/CircuitBreakerStatusIndicator';
+import { evaluateCircuitBreakerStatus } from '@/utils/circuitBreaker.utils';
 
 export type TradeSide = 'buy' | 'sell';
+
+/**
+ * Merges contract-returned dynamic fee rates over the dialog's configured
+ * defaults, keeping defaults wherever the contract omits a field (#994).
+ */
+function mergeFeeRates(
+	base: ContractDynamicFeeRate,
+	incoming: ContractDynamicFeeRate
+): ContractDynamicFeeRate {
+	return {
+		baseFeeBps: incoming.baseFeeBps ?? base.baseFeeBps,
+		volumeTierDiscountBps:
+			incoming.volumeTierDiscountBps ?? base.volumeTierDiscountBps,
+		protocolFeeBps: incoming.protocolFeeBps ?? base.protocolFeeBps,
+		creatorRoyaltyBps: incoming.creatorRoyaltyBps ?? base.creatorRoyaltyBps,
+	};
+}
 
 export interface TradeDialogProps {
 	open: boolean;
@@ -47,8 +97,29 @@ export interface TradeDialogProps {
 	protocolFeeBps?: number;
 	/** Creator fee in basis points for fee preview (defaults to FEE_BOUNDS.DEFAULT_FEE_BPS) */
 	creatorFeeBps?: number;
+	/** Ledger sequence the key was created at, from the key detail API. */
+	createdAtLedger?: number | null;
+	/** Current network ledger sequence, used to evaluate the 7-day launch window. */
+	currentLedger?: number | null;
+	/** Early-sell penalty in basis points, from the key detail API. */
+	launchPenaltyBps?: number | null;
 	/** Max buy quantity allowed per transaction; null means no limit. */
 	maxBuyQuantity?: number | null;
+	/** Maximum holding cap per wallet configured by creator (#1015); null means no limit. */
+	holdingCap?: number | null;
+	maxHoldingCap?: number | null;
+	/** Live key trading config carrying the bid-ask spread (#951). */
+	keyConfig?: KeyConfig | null;
+	/** Whether the key config query is still loading. */
+	isKeyConfigLoading?: boolean;
+	/** Key-level circuit breaker threshold in percent (defaults to keyConfig or 15%) (#1034). */
+	circuitBreakerThresholdPercent?: number | null;
+	/** Key-level circuit breaker threshold in basis points (defaults to keyConfig or 1500) (#1034). */
+	circuitBreakerThresholdBps?: number | null;
+	/** Whether to display the confirmation modal step before submission (#919). Defaults to false. */
+	requireConfirmation?: boolean;
+	/** Optional XLM/USD spot rate for the confirmation fee USD equivalent (#994). */
+	xlmUsdRate?: number | null;
 	onOpenChange: (open: boolean) => void;
 	onConfirm: (
 		amount: number,
@@ -56,6 +127,9 @@ export interface TradeDialogProps {
 		slippage?: SlippageBounds | null
 	) => Promise<void> | void;
 	isSubmitting?: boolean;
+	networkFeeEstimateProvider?: {
+		getFeeData: () => Promise<{ gasPrice?: bigint }>;
+	};
 }
 
 const TradeDialog: React.FC<TradeDialogProps> = ({
@@ -67,19 +141,42 @@ const TradeDialog: React.FC<TradeDialogProps> = ({
 	currentSupply,
 	protocolFeeBps = FEE_BOUNDS.DEFAULT_FEE_BPS,
 	creatorFeeBps = FEE_BOUNDS.DEFAULT_FEE_BPS,
+	createdAtLedger,
+	currentLedger,
+	launchPenaltyBps,
 	maxBuyQuantity = null,
+	holdingCap = null,
+	maxHoldingCap = null,
+	keyConfig,
+	isKeyConfigLoading = false,
+	circuitBreakerThresholdPercent,
+	circuitBreakerThresholdBps,
+	requireConfirmation = false,
+	xlmUsdRate = null,
 	onOpenChange,
 	onConfirm,
 	isSubmitting = false,
 }) => {
+	const effectiveHoldingCap = useMemo(
+		() =>
+			holdingCap ??
+			maxHoldingCap ??
+			keyConfig?.holdingCap ??
+			keyConfig?.maxHoldingCap ??
+			null,
+		[holdingCap, maxHoldingCap, keyConfig?.holdingCap, keyConfig?.maxHoldingCap]
+	);
 	const [amountText, setAmountText] = useState('1');
 	const [touched, setTouched] = useState(false);
 	const [pricePreview, setPricePreview] = useState<FeeBreakdown | null>(null);
 	const [previewLoading, setPreviewLoading] = useState(false);
 	const [previewError, setPreviewError] = useState<string | null>(null);
-	const [slippageTolerancePercent, setSlippageTolerancePercent] = useState(
-		DEFAULT_SLIPPAGE_TOLERANCE_PERCENT
-	);
+	const [slippageTolerancePercent, setSlippageTolerancePercent] =
+		useSlippageTolerancePreference();
+	const [acknowledgedImpactKey, setAcknowledgedImpactKey] = useState<
+		string | null
+	>(null);
+	const [confirmationOpen, setConfirmationOpen] = useState(false);
 	const amountInputRef = useRef<HTMLInputElement | null>(null);
 	const pricePreviewFailureLogged = useRef(false);
 	const previewAbortControllerRef = useRef<AbortController | null>(null);
@@ -101,10 +198,84 @@ const TradeDialog: React.FC<TradeDialogProps> = ({
 			setPricePreview(null);
 			setPreviewLoading(false);
 			setPreviewError(null);
-			setSlippageTolerancePercent(DEFAULT_SLIPPAGE_TOLERANCE_PERCENT);
+			setAcknowledgedImpactKey(null);
 			pricePreviewFailureLogged.current = false;
 		}
 	}, [open]);
+
+	// Internal keyboard shortcuts for amount adjustment when the dialog is open.
+	// Quick presets: 1→1, 2→2, 3→3, 4→5, 5→10, Shift+1→10
+	// Adjust: +/- to increment/decrement by 1
+	useEffect(() => {
+		if (!open || isSubmitting) return;
+
+		const handleAmountKey = (event: KeyboardEvent) => {
+			if (event.defaultPrevented || event.repeat) return;
+
+			// Only intercept when the amount input is focused
+			const activeEl = document.activeElement;
+			if (
+				!(activeEl instanceof HTMLInputElement) ||
+				activeEl.dataset.testid !== 'trade-dialog-amount'
+			) {
+				return;
+			}
+
+			// Ignore if modifier keys are held (except Shift for !)
+			if (event.ctrlKey || event.metaKey || event.altKey) return;
+
+			const key = event.key;
+
+			// Quick amount presets
+			const presets: Record<string, number> = {
+				'1': 1,
+				'2': 2,
+				'3': 3,
+				'4': 5,
+				'5': 10,
+			};
+
+			if (!event.shiftKey && presets[key] !== undefined) {
+				event.preventDefault();
+				const clamped = clampBuyQuantity(presets[key].toString());
+				setAmountText(clamped.value.toString());
+				setTouched(true);
+				return;
+			}
+
+			// Shift+1 = 10
+			if (key === '!' && event.shiftKey) {
+				event.preventDefault();
+				const clamped = clampBuyQuantity('10');
+				setAmountText(clamped.value.toString());
+				setTouched(true);
+				return;
+			}
+
+			// Adjust amount: + and -
+			if (key === '+' || (key === '=' && event.shiftKey)) {
+				event.preventDefault();
+				const current = Number(amountText) || 0;
+				const next = Math.max(1, current + 1);
+				const clamped = clampBuyQuantity(next.toString());
+				setAmountText(clamped.value.toString());
+				setTouched(true);
+				return;
+			}
+
+			if (key === '-') {
+				event.preventDefault();
+				const current = Number(amountText) || 0;
+				const next = Math.max(1, current - 1);
+				const clamped = clampBuyQuantity(next.toString());
+				setAmountText(clamped.value.toString());
+				setTouched(true);
+			}
+		};
+
+		window.addEventListener('keydown', handleAmountKey);
+		return () => window.removeEventListener('keydown', handleAmountKey);
+	}, [open, isSubmitting, amountText]);
 
 	const handleBlur = () => {
 		setTouched(true);
@@ -119,9 +290,32 @@ const TradeDialog: React.FC<TradeDialogProps> = ({
 
 	const parsedAmount = useMemo(() => {
 		const normalized = amountText.trim();
-		if (!normalized) return NaN;
+		if (!normalized) return Number.NaN;
 		return Number(normalized);
 	}, [amountText]);
+
+	const isCapLimitReached = useMemo(
+		() =>
+			side === 'buy' &&
+			effectiveHoldingCap != null &&
+			Number.isFinite(effectiveHoldingCap) &&
+			effectiveHoldingCap > 0 &&
+			availableHoldings >= effectiveHoldingCap,
+		[side, effectiveHoldingCap, availableHoldings]
+	);
+
+	const isCapBreached = useMemo(
+		() =>
+			side === 'buy' &&
+			effectiveHoldingCap != null &&
+			Number.isFinite(effectiveHoldingCap) &&
+			effectiveHoldingCap > 0 &&
+			Number.isFinite(parsedAmount) &&
+			parsedAmount > 0 &&
+			availableHoldings + parsedAmount > effectiveHoldingCap,
+		[side, effectiveHoldingCap, availableHoldings, parsedAmount]
+	);
+
 
 	const validationError = useMemo((): string | null => {
 		const normalized = amountText.trim();
@@ -136,16 +330,45 @@ const TradeDialog: React.FC<TradeDialogProps> = ({
 		) {
 			return `Maximum ${formatNumber(maxBuyQuantity)} keys per transaction for this key`;
 		}
+		if (
+			side === 'buy' &&
+			effectiveHoldingCap != null &&
+			Number.isFinite(effectiveHoldingCap) &&
+			effectiveHoldingCap > 0
+		) {
+			if (availableHoldings >= effectiveHoldingCap) {
+				return `Holding cap reached (${formatNumber(effectiveHoldingCap)} keys max per wallet).`;
+			}
+			if (
+				Number.isFinite(parsedAmount) &&
+				parsedAmount > 0 &&
+				availableHoldings + parsedAmount > effectiveHoldingCap
+			) {
+				return `Purchase would exceed the holding cap of ${formatNumber(effectiveHoldingCap)} keys (you hold ${formatNumber(availableHoldings)}).`;
+			}
+		}
 		if (side === 'sell' && parsedAmount > availableHoldings)
 			return `You can't sell more than your holdings (${formatNumber(availableHoldings)} keys).`;
 		return null;
-	}, [amountText, parsedAmount, side, maxBuyQuantity, availableHoldings]);
+	}, [
+		amountText,
+		parsedAmount,
+		side,
+		maxBuyQuantity,
+		availableHoldings,
+		effectiveHoldingCap,
+	]);
 
 	const amountValid = validationError === null;
 	const showError = touched && validationError !== null;
 
 	const title = side === 'buy' ? 'Buy keys' : 'Sell keys';
-	const confirmLabel = side === 'buy' ? 'Confirm buy' : 'Confirm sell';
+	const confirmLabel = useMemo(() => {
+		if (side === 'sell') return 'Confirm sell';
+		if (isCapLimitReached) return 'Holding Cap Reached';
+		if (isCapBreached) return 'Holding Cap Exceeded';
+		return 'Confirm buy';
+	}, [side, isCapLimitReached, isCapBreached]);
 	const estimatedNetworkFee = formatTransactionFeeDisplay(
 		TRADE_FEE_ESTIMATE.DEFAULT_NETWORK_FEE,
 		{ unit: TRADE_FEE_ESTIMATE.UNIT }
@@ -161,6 +384,22 @@ const TradeDialog: React.FC<TradeDialogProps> = ({
 		}
 		return estimateSellProceeds(keyPriceStroops, currentSupply, parsedAmount);
 	}, [side, keyPriceStroops, currentSupply, parsedAmount]);
+
+	const launchPenalty = useMemo(
+		() =>
+			calculateLaunchPenalty(
+				estimatedProceedsStroops,
+				createdAtLedger,
+				currentLedger,
+				launchPenaltyBps
+			),
+		[
+			estimatedProceedsStroops,
+			createdAtLedger,
+			currentLedger,
+			launchPenaltyBps,
+		]
+	);
 
 	const estimatedTotalStroops = useMemo(() => {
 		if (
@@ -194,6 +433,69 @@ const TradeDialog: React.FC<TradeDialogProps> = ({
 			slippageTolerancePercent
 		);
 	}, [side, slippageReferencePriceStroops, slippageTolerancePercent]);
+
+	const priceImpactPercent = useMemo(() => {
+		if (!amountValid || !Number.isFinite(parsedAmount)) return 0;
+		if (currentSupply == null || currentSupply < 0) return 0;
+		return calculateTradePriceImpact({
+			side,
+			quantity: parsedAmount,
+			currentSupply,
+		});
+	}, [amountValid, parsedAmount, side, currentSupply]);
+
+	const effectiveCircuitBreakerThresholdPercent =
+		circuitBreakerThresholdPercent ??
+		keyConfig?.circuitBreakerThresholdPercent ??
+		null;
+	const effectiveCircuitBreakerThresholdBps =
+		circuitBreakerThresholdBps ??
+		keyConfig?.circuitBreakerThresholdBps ??
+		null;
+
+	const circuitBreakerStatus = useMemo(() => {
+		if (side !== 'buy' || !amountValid) return null;
+		return evaluateCircuitBreakerStatus({
+			impactPercent: priceImpactPercent,
+			thresholdPercent: effectiveCircuitBreakerThresholdPercent,
+			thresholdBps: effectiveCircuitBreakerThresholdBps,
+		});
+	}, [
+		side,
+		amountValid,
+		priceImpactPercent,
+		effectiveCircuitBreakerThresholdPercent,
+		effectiveCircuitBreakerThresholdBps,
+	]);
+
+	const isCircuitBreakerBreached = Boolean(
+		side === 'buy' && circuitBreakerStatus?.isBreached
+	);
+
+	const impactWarningActive =
+		amountValid &&
+		isHighPriceImpact(priceImpactPercent, slippageTolerancePercent);
+	const impactAcknowledgementKey = `${side}:${parsedAmount}:${currentSupply ?? 0}:${slippageTolerancePercent}`;
+	const impactAcknowledged =
+		acknowledgedImpactKey === impactAcknowledgementKey;
+
+	const handleMaxClick = () => {
+		setTouched(true);
+		if (side === 'sell') {
+			setAmountText(String(Math.max(0, availableHoldings)));
+		} else {
+			let maxVal = maxBuyQuantity ?? BUY_QUANTITY_BOUNDS.MAX_QTY;
+			if (
+				effectiveHoldingCap != null &&
+				Number.isFinite(effectiveHoldingCap) &&
+				effectiveHoldingCap > 0
+			) {
+				const remainingCap = Math.max(0, effectiveHoldingCap - availableHoldings);
+				maxVal = Math.min(maxVal, remainingCap);
+			}
+			setAmountText(String(maxVal));
+		}
+	};
 
 	// Fetch price preview (fee breakdown) for buy transactions
 	useEffect(() => {
@@ -290,50 +592,170 @@ const TradeDialog: React.FC<TradeDialogProps> = ({
 		}
 	}, [open, side, estimatedProceedsStroops, creatorName, parsedAmount]);
 
-	return (
-		<Dialog
-			open={open}
-			onOpenChange={next => !isSubmitting && onOpenChange(next)}
-		>
-			<DialogContent
-				className="max-w-md"
-				showCloseButton={!isSubmitting}
-				showEscapeHint={!isSubmitting}
-				onOpenAutoFocus={event => {
-					event.preventDefault();
-					amountInputRef.current?.focus();
-				}}
-				onCloseAutoFocus={event => {
-					event.preventDefault();
-					triggerElementRef.current?.focus();
-				}}
-				onEscapeKeyDown={event => {
-					if (isSubmitting) event.preventDefault();
-				}}
-				onInteractOutside={event => {
-					if (isSubmitting) event.preventDefault();
-				}}
-			>
-				<DialogHeader>
-					<DialogTitle>{title}</DialogTitle>
-					<DialogDescription>
-						{side === 'buy'
-							? `Purchase creator keys for ${creatorName}.`
-							: `Sell creator keys for ${creatorName}.`}
-					</DialogDescription>
-				</DialogHeader>
+	const isMobile = useIsMobile();
 
-				{side === 'buy' && keyPriceStroops != null && (
-					<p className="text-sm text-white/60">
-						Unit price:{' '}
-						<span className="font-semibold text-amber-300/90 tabular-nums">
-							{formatDisplayKeyPrice(keyPriceStroops)}
-						</span>
-					</p>
-				)}
+	// Live dynamic fee rate from the contract (#994). Mirrors the debounced
+	// price-preview effect above: fetched while the dialog is open (with a
+	// small debounce) and re-fetched whenever the trade amount changes, so
+	// the confirmation screen quotes the rate the contract will actually
+	// charge. The breakdown is derived from the live rates and the current
+	// trade notional, so it refreshes whenever the amount changes.
+	const [dynamicFeeRates, setDynamicFeeRates] = useState<ContractDynamicFeeRate>(
+		{
+			protocolFeeBps,
+			creatorRoyaltyBps: creatorFeeBps,
+		}
+	);
+	const [isFeeRateLoading, setFeeRateLoading] = useState(false);
+	const [feeRateError, setFeeRateError] = useState<string | null>(null);
+	const feeRateAbortRef = useRef<AbortController | null>(null);
 
-				<div className="space-y-2">
-					<div className="text-sm text-white/70">Amount</div>
+	useEffect(() => {
+		if (!open) {
+			setDynamicFeeRates({ protocolFeeBps, creatorRoyaltyBps: creatorFeeBps });
+			setFeeRateLoading(false);
+			setFeeRateError(null);
+			return;
+		}
+
+		// Debounce to avoid hammering the contract while the user types.
+		const timeoutId = window.setTimeout(() => {
+			feeRateAbortRef.current?.abort();
+			const controller = new AbortController();
+			feeRateAbortRef.current = controller;
+
+			setFeeRateLoading(true);
+			setFeeRateError(null);
+
+			courseService
+				.getDynamicFeeRate(creatorName, { signal: controller.signal })
+				.then(rates => {
+					if (controller.signal.aborted) return;
+					// Merge over the dialog's configured rates so a partial
+					// contract payload never blanks a fee row.
+					setDynamicFeeRates(
+						mergeFeeRates(
+							{ protocolFeeBps, creatorRoyaltyBps: creatorFeeBps },
+							rates
+						)
+					);
+					setFeeRateLoading(false);
+				})
+				.catch(error => {
+					if (
+						controller.signal.aborted ||
+						(error instanceof Error && error.name === 'CanceledError')
+					) {
+						return;
+					}
+					if (error instanceof DOMException && error.name === 'AbortError') {
+						return;
+					}
+					// Keep the last known good rates; just surface the error.
+					setFeeRateError(
+						error instanceof Error
+							? error.message
+							: 'Failed to fetch the dynamic fee rate'
+					);
+					setFeeRateLoading(false);
+				});
+		}, 200);
+
+		return () => clearTimeout(timeoutId);
+	}, [open, creatorName, protocolFeeBps, creatorFeeBps]);
+
+	const handleFeeRateRetry = useCallback(() => {
+		setFeeRateError(null);
+		setFeeRateLoading(true);
+		courseService
+			.getDynamicFeeRate(creatorName)
+			.then(rates => {
+				setDynamicFeeRates(
+					mergeFeeRates(
+						{ protocolFeeBps, creatorRoyaltyBps: creatorFeeBps },
+						rates
+					)
+				);
+				setFeeRateLoading(false);
+			})
+			.catch(error => {
+				setFeeRateError(
+					error instanceof Error
+						? error.message
+						: 'Failed to fetch the dynamic fee rate'
+				);
+				setFeeRateLoading(false);
+			});
+	}, [creatorName, protocolFeeBps, creatorFeeBps]);
+
+	const dynamicFeeBreakdown = useMemo<DynamicFeeBreakdownData | null>(() => {
+		if (side === 'buy') {
+			if (
+				!amountValid ||
+				parsedAmount <= 0 ||
+				estimatedTotalStroops == null ||
+				estimatedTotalStroops <= 0
+			) {
+				return null;
+			}
+		} else if (
+			!amountValid ||
+			parsedAmount <= 0 ||
+			estimatedProceedsStroops == null ||
+			estimatedProceedsStroops <= 0
+		) {
+			return null;
+		}
+
+		return buildDynamicFeeBreakdown({
+			// Fees are computed on the gross key cost / gross proceeds — never
+			// on the fee-inclusive total — so components never compound.
+			notionalStroops:
+				side === 'buy' ? estimatedTotalStroops : estimatedProceedsStroops,
+			rates: dynamicFeeRates,
+			isSell: side === 'sell',
+			xlmUsdRate,
+		});
+	}, [
+		side,
+		amountValid,
+		parsedAmount,
+		estimatedTotalStroops,
+		estimatedProceedsStroops,
+		dynamicFeeRates,
+		xlmUsdRate,
+	]);
+
+	const bodyContent = (
+		<>
+			{side === 'buy' && keyPriceStroops != null && (
+				<p className="text-sm text-white/60">
+					Unit price:{' '}
+					<span className="font-semibold text-amber-300/90 tabular-nums">
+						{formatDisplayKeyPrice(keyPriceStroops)}
+					</span>
+				</p>
+			)}
+
+			{/* Configurable bid-ask spread between buy and sell price (#951) */}
+			<SpreadIndicator
+				buyPriceStroops={keyConfig?.buyPriceStroops}
+				sellPriceStroops={keyConfig?.sellPriceStroops}
+				spreadStroops={keyConfig?.spreadStroops}
+				spreadBps={keyConfig?.spreadBps}
+				isLoading={isKeyConfigLoading}
+			/>
+
+			{side === 'sell' && (
+				<LaunchPenaltyWarning
+					visible={launchPenalty.applies}
+					penaltyBps={launchPenalty.penaltyBps}
+				/>
+			)}
+
+			<div className="space-y-2">
+				<div className="text-sm text-white/70">Amount</div>
+				<div className="relative flex items-center">
 					<input
 						ref={amountInputRef}
 						inputMode="decimal"
@@ -345,7 +767,7 @@ const TradeDialog: React.FC<TradeDialogProps> = ({
 						onBlur={handleBlur}
 						disabled={isSubmitting}
 						className={cn(
-							'w-full rounded-xl border bg-white/[0.04] px-3 py-2 text-white outline-none transition-colors',
+							'w-full rounded-xl border bg-white/[0.04] px-3 py-2 pr-16 text-white outline-none transition-colors',
 							'border-white/10 focus:border-amber-500/50 focus:ring-2 focus:ring-amber-500/15',
 							showError ? 'border-red-500/60' : ''
 						)}
@@ -357,161 +779,371 @@ const TradeDialog: React.FC<TradeDialogProps> = ({
 						data-focus-order="1"
 						data-testid="trade-dialog-amount"
 					/>
-					{showError && (
-						<p
-							id="trade-amount-error"
-							role="alert"
-							className="text-xs text-red-300"
-							data-testid="trade-dialog-amount-error"
-						>
-							{validationError}
-						</p>
-					)}
-					<div className="flex flex-wrap items-center gap-2 text-xs text-white/45">
-						<span
-							aria-label={`Current wallet holdings: ${formatNumber(availableHoldings)} keys`}
-						>
-							Holdings: {formatNumber(availableHoldings)} keys
-						</span>
-						{side === 'sell' &&
-							availableHoldings > 0 &&
-							Number.isFinite(parsedAmount) &&
-							parsedAmount > 0 && (
-								<PercentageBadge
-									label="of holdings"
-									value={(parsedAmount / availableHoldings) * 100}
-									tone={
-										parsedAmount > availableHoldings
-											? 'negative'
-											: 'neutral'
-									}
-								/>
-							)}
-					</div>
-					{side === 'buy' && (
-						<NetworkFeeHint
-							variant="text"
-							fee={estimatedNetworkFee}
-							className="text-white/45"
-						/>
-					)}
-					{side === 'buy' && amountValid && (
-						<BuyFeeBreakdown
-							breakdown={pricePreview}
-							isLoading={previewLoading}
-							error={previewError}
-							onRetry={() => {
-								setPreviewError(null);
-								setPreviewLoading(true);
-							}}
-						/>
-					)}
-					{side === 'buy' && estimatedTotalStroops != null && (
-						<div className="text-xs text-white/45 mt-2">
-							Estimated total (approximate):{' '}
-							<span className="font-semibold text-amber-300/90 tabular-nums">
-								{formatDisplayKeyPrice(estimatedTotalStroops)}
-							</span>
-						</div>
-					)}
-					{side === 'sell' && (
-						<div className="text-xs text-white/45 mt-2">
-							{estimatedProceedsStroops != null ? (
-								<>
-									Estimated proceeds (approximate):{' '}
-									<span className="font-semibold text-amber-300/90 tabular-nums">
-										{formatDisplayKeyPrice(estimatedProceedsStroops)}
-									</span>
-								</>
-							) : (
-								<>Estimated proceeds unavailable</>
-							)}
-						</div>
-					)}
-					{amountValid && (
-						<div className="mt-3 border-t border-white/10 pt-3">
-							<SlippageToleranceSelector
-								value={slippageTolerancePercent}
-								onChange={setSlippageTolerancePercent}
-								disabled={isSubmitting}
-							/>
-							{slippageBounds && (
-								<p
-									className="mt-2 text-[0.7rem] text-white/45"
-									data-testid="trade-dialog-slippage-bound"
-								>
-									{side === 'buy'
-										? slippageBounds.maxPriceStroops != null && (
-												<>
-													Max price:{' '}
-													<span className="font-semibold text-white/70 tabular-nums">
-														{formatDisplayKeyPrice(
-															slippageBounds.maxPriceStroops
-														)}
-													</span>
-												</>
-											)
-										: slippageBounds.minPriceStroops != null && (
-												<>
-													Min price:{' '}
-													<span className="font-semibold text-white/70 tabular-nums">
-														{formatDisplayKeyPrice(
-															slippageBounds.minPriceStroops
-														)}
-													</span>
-												</>
-											)}
-								</p>
-							)}
-						</div>
-					)}
-				</div>
-
-				{/*
-				 * Focus order is intentional: amount input → Cancel → Confirm.
-				 * That matches the visual left-to-right reading order in the
-				 * footer (`sm:justify-between` puts Cancel on the left, Confirm
-				 * on the right) and keeps the destructive action one Tab away
-				 * from the primary action so users always pass through Cancel
-				 * before reaching Confirm. The covering test in
-				 * `__tests__/TradeDialog.focusOrder.test.tsx` guards this.
-				 */}
-				<DialogFooter className="sm:justify-between">
-					<Button
+					<button
 						type="button"
-						variant="ghost"
-						onClick={() => onOpenChange(false)}
-						disabled={isSubmitting}
-						data-focus-order="2"
-						data-testid="trade-dialog-cancel"
-					>
-						Cancel
-					</Button>
-					<Button
-						type="button"
-						onClick={() =>
-							onConfirm(parsedAmount, pricePreview, slippageBounds)
-						}
+						data-testid="trade-dialog-max-button"
+						onClick={handleMaxClick}
 						disabled={
-							!amountValid ||
 							isSubmitting ||
-							(side === 'buy' &&
-								(previewLoading || previewError != null))
+							(side === 'sell' && availableHoldings <= 0) ||
+							(side === 'buy' && isCapLimitReached)
 						}
-						aria-busy={isSubmitting || undefined}
-						data-focus-order="3"
-						data-testid="trade-dialog-confirm"
+						// ≥44px tap target on mobile; compact pill on sm+ (#1055).
+						className="absolute right-2 -my-1 min-h-11 rounded-md border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs font-bold text-amber-300 transition-colors hover:bg-amber-400/20 active:scale-95 disabled:pointer-events-none disabled:opacity-40 sm:my-0 sm:min-h-0 sm:px-2 sm:py-0.5"
 					>
-						<StableButtonContent
-							isLoading={isSubmitting}
-							loadingLabel="Submitting…"
-						>
-							{confirmLabel}
-						</StableButtonContent>
-					</Button>
-				</DialogFooter>
-			</DialogContent>
-		</Dialog>
+						MAX
+					</button>
+				</div>
+				{showError && (
+					<p
+						id="trade-amount-error"
+						role="alert"
+						className="text-xs text-red-300"
+						data-testid="trade-dialog-amount-error"
+					>
+						{validationError}
+					</p>
+				)}
+				{/* Holding cap indicator on buy form (#1015) */}
+				{side === 'buy' && effectiveHoldingCap != null && effectiveHoldingCap > 0 && (
+					<HoldingCapIndicator
+						currentHoldings={availableHoldings}
+						holdingCap={effectiveHoldingCap}
+						purchaseAmount={
+							Number.isFinite(parsedAmount) && parsedAmount > 0
+								? parsedAmount
+								: 0
+						}
+						creatorName={creatorName}
+						className="my-2.5"
+					/>
+				)}
+				<div className="flex flex-wrap items-center gap-2 text-xs text-white/45">
+					<span
+						aria-label={`Current wallet holdings: ${formatNumber(availableHoldings)} keys`}
+					>
+						Holdings: {formatNumber(availableHoldings)} keys
+					</span>
+					{side === 'sell' &&
+						availableHoldings > 0 &&
+						Number.isFinite(parsedAmount) &&
+						parsedAmount > 0 && (
+							<PercentageBadge
+								label="of holdings"
+								value={(parsedAmount / availableHoldings) * 100}
+								tone={
+									parsedAmount > availableHoldings
+										? 'negative'
+										: 'neutral'
+								}
+							/>
+						)}
+				</div>
+				{side === 'buy' && (
+					<CircuitBreakerStatusIndicator
+						impactPercent={priceImpactPercent}
+						thresholdPercent={effectiveCircuitBreakerThresholdPercent}
+						thresholdBps={effectiveCircuitBreakerThresholdBps}
+						isValid={amountValid}
+					/>
+				)}
+				{side === 'buy' && (
+					<NetworkFeeHint
+						variant="text"
+						fee={estimatedNetworkFee}
+						className="text-white/45"
+					/>
+				)}
+				{side === 'buy' && amountValid && (
+					<BuyFeeBreakdown
+						breakdown={pricePreview}
+						isLoading={previewLoading}
+						error={previewError}
+						onRetry={() => {
+							setPreviewError(null);
+							setPreviewLoading(true);
+						}}
+					/>
+				)}
+				{side === 'buy' && estimatedTotalStroops != null && (
+					<div className="text-xs text-white/45 mt-2">
+						Estimated total (approximate):{' '}
+						<span className="font-semibold text-amber-300/90 tabular-nums">
+							{formatDisplayKeyPrice(estimatedTotalStroops)}
+						</span>
+					</div>
+				)}
+				{side === 'sell' && (
+					<SellFeeBreakdown
+						grossProceedsStroops={estimatedProceedsStroops}
+						launchPenalty={launchPenalty}
+					/>
+				)}
+				{amountValid && (
+					<div className="mt-3 border-t border-white/10 pt-3">
+						<SlippageToleranceSelector
+							value={slippageTolerancePercent}
+							onChange={setSlippageTolerancePercent}
+							disabled={isSubmitting}
+						/>
+						{slippageBounds && (
+							<p
+								className="mt-2 text-[0.7rem] text-white/45"
+								data-testid="trade-dialog-slippage-bound"
+							>
+								{side === 'buy'
+									? slippageBounds.maxPriceStroops != null && (
+											<>
+												Max price:{' '}
+												<span className="font-semibold text-white/70 tabular-nums">
+													{formatDisplayKeyPrice(
+														slippageBounds.maxPriceStroops
+													)}
+												</span>
+											</>
+										)
+									: slippageBounds.minPriceStroops != null && (
+											<>
+												Min price:{' '}
+												<span className="font-semibold text-white/70 tabular-nums">
+													{formatDisplayKeyPrice(
+														slippageBounds.minPriceStroops
+													)}
+												</span>
+											</>
+										)}
+							</p>
+						)}
+						<PriceImpactWarning
+							impactPercent={priceImpactPercent}
+							threshold={slippageTolerancePercent}
+							className="mt-2"
+						/>
+						{impactWarningActive && (
+							<PriceImpactOverrideCheckbox
+								checked={impactAcknowledged}
+								onChange={checked =>
+									setAcknowledgedImpactKey(
+										checked ? impactAcknowledgementKey : null
+									)
+								}
+							/>
+						)}
+					</div>
+				)}
+			</div>
+		</>
+	);
+
+	const actionButtons = (
+		<>
+			<Button
+				type="button"
+				variant="ghost"
+				onClick={() => onOpenChange(false)}
+				disabled={isSubmitting}
+				data-focus-order="2"
+				data-testid="trade-dialog-cancel"
+				// ≥44px tap targets for the sheet actions on mobile (#1055).
+				className={cn(isMobile && 'min-h-11 w-full')}
+			>
+				Cancel
+			</Button>
+			<Button
+				type="button"
+				onClick={() => {
+					if (isCircuitBreakerBreached) return;
+					if (impactWarningActive && !impactAcknowledged) return;
+					if (requireConfirmation) {
+						setConfirmationOpen(true);
+					} else {
+						onConfirm(parsedAmount, pricePreview, slippageBounds);
+					}
+				}}
+				disabled={
+					!amountValid ||
+					isSubmitting ||
+					isCircuitBreakerBreached ||
+					(impactWarningActive && !impactAcknowledged) ||
+					(side === 'buy' && (previewLoading || previewError != null))
+				}
+				aria-busy={isSubmitting || undefined}
+				data-focus-order="3"
+				data-testid="trade-dialog-confirm"
+				className={cn(isMobile && 'min-h-11 w-full')}
+			>
+				<StableButtonContent
+					isLoading={isSubmitting}
+					loadingLabel="Submitting…"
+				>
+					{isCircuitBreakerBreached ? 'Circuit Breaker Tripped' : confirmLabel}
+				</StableButtonContent>
+			</Button>
+		</>
+	);
+
+	const confirmationModal = (
+		<TradeConfirmationModal
+			open={confirmationOpen}
+			onOpenChange={setConfirmationOpen}
+			side={side}
+			creatorName={creatorName}
+			amount={parsedAmount}
+			unitPriceStroops={keyPriceStroops}
+			totalStroops={slippageReferencePriceStroops}
+			feeBreakdown={dynamicFeeBreakdown}
+			feeIsLoading={isFeeRateLoading}
+			feeError={feeRateError}
+			onFeeRetry={handleFeeRateRetry}
+			slippageTolerancePercent={slippageTolerancePercent}
+			maxPriceStroops={slippageBounds?.maxPriceStroops ?? null}
+			minPriceStroops={slippageBounds?.minPriceStroops ?? null}
+			priceImpactPercent={priceImpactPercent}
+			onConfirm={async () => {
+				if (isCircuitBreakerBreached) return;
+				if (impactWarningActive && !impactAcknowledged) return;
+				await onConfirm(parsedAmount, pricePreview, slippageBounds);
+				setConfirmationOpen(false);
+			}}
+			onCancel={() => setConfirmationOpen(false)}
+			isSubmitting={isSubmitting}
+		/>
+	);
+
+	if (isMobile) {
+		return (
+			<>
+				<BottomSheet
+					open={open}
+					onOpenChange={next => !isSubmitting && onOpenChange(next)}
+				>
+					<BottomSheetContent
+						className="max-h-[calc(100dvh-80px)] overflow-y-auto"
+						enableDrag={!isSubmitting}
+						hideCloseButton={isSubmitting}
+						onOpenAutoFocus={event => {
+							event.preventDefault();
+							amountInputRef.current?.focus();
+						}}
+						onCloseAutoFocus={event => {
+							event.preventDefault();
+							triggerElementRef.current?.focus();
+						}}
+						onEscapeKeyDown={event => {
+							if (isSubmitting) event.preventDefault();
+						}}
+						onInteractOutside={event => {
+							if (isSubmitting) event.preventDefault();
+						}}
+					>
+						<BottomSheetHandle />
+						<div className="flex flex-col gap-2 text-center sm:text-left mb-4">
+							<BottomSheetTitle className="text-lg leading-none font-semibold">
+								{title}
+							</BottomSheetTitle>
+							<BottomSheetDescription className="text-muted-foreground text-sm">
+								{side === 'buy'
+									? `Purchase creator keys for ${creatorName}.`
+									: `Sell creator keys for ${creatorName}.`}
+						</BottomSheetDescription>
+					</div>
+					{bodyContent}
+						{/*
+						 * Full-width ≥44px tap targets on mobile (#1055); row
+						 * layout on sm+ where the pointer cursor allows smaller
+						 * buttons.
+						 */}
+						<div className="mt-6 flex flex-col-reverse gap-2 sm:flex-row sm:justify-between">
+							{actionButtons}
+						</div>
+					</BottomSheetContent>
+				</BottomSheet>
+				{confirmationModal}
+			</>
+		);
+	}
+
+	return (
+		<>
+			<Dialog
+				open={open}
+				onOpenChange={next => !isSubmitting && onOpenChange(next)}
+			>
+				<DialogContent
+					className="max-w-md"
+					showCloseButton={!isSubmitting}
+					showEscapeHint={!isSubmitting}
+					onOpenAutoFocus={event => {
+						event.preventDefault();
+						amountInputRef.current?.focus();
+					}}
+					onCloseAutoFocus={event => {
+						event.preventDefault();
+						triggerElementRef.current?.focus();
+					}}
+					onEscapeKeyDown={event => {
+						if (isSubmitting) event.preventDefault();
+					}}
+					onInteractOutside={event => {
+						if (isSubmitting) event.preventDefault();
+					}}
+				>
+					<DialogHeader>
+						<DialogTitle>{title}</DialogTitle>
+						<DialogDescription>
+							{side === 'buy'
+								? `Purchase creator keys for ${creatorName}.`
+								: `Sell creator keys for ${creatorName}.`}
+						</DialogDescription>
+					</DialogHeader>
+
+					{bodyContent}
+
+					{/*
+					 * Focus order is intentional: amount input → Cancel → Confirm.
+					 * That matches the visual left-to-right reading order in the
+					 * footer (`sm:justify-between` puts Cancel on the left, Confirm
+					 * on the right) and keeps the destructive action one Tab away
+					 * from the primary action so users always pass through Cancel
+					 * before reaching Confirm. The covering test in
+					 * `__tests__/TradeDialog.focusOrder.test.tsx` guards this.
+					 */}
+					<DialogFooter className="sm:justify-between">
+						{actionButtons}
+					</DialogFooter>
+
+					{/* Subtle keyboard shortcut hint for power users */}
+					<div
+						className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 border-t border-white/5 pt-3 text-[11px] text-white/30"
+						aria-hidden="true"
+						data-testid="trade-dialog-shortcut-hint"
+					>
+						<span className="flex items-center gap-1">
+							<kbd className="rounded border border-white/10 bg-white/[0.04] px-1 py-0.5 font-mono text-[10px]">
+								Enter
+							</kbd>
+							<span>confirm</span>
+						</span>
+						<span className="flex items-center gap-1">
+							<kbd className="rounded border border-white/10 bg-white/[0.04] px-1 py-0.5 font-mono text-[10px]">
+								Esc
+							</kbd>
+							<span>close</span>
+						</span>
+						<span className="flex items-center gap-1">
+							<kbd className="rounded border border-white/10 bg-white/[0.04] px-1 py-0.5 font-mono text-[10px]">
+								+
+							</kbd>
+							<kbd className="rounded border border-white/10 bg-white/[0.04] px-1 py-0.5 font-mono text-[10px]">
+								-
+							</kbd>
+							<span>adjust</span>
+						</span>
+					</div>
+				</DialogContent>
+			</Dialog>
+			{confirmationModal}
+		</>
 	);
 };
 
